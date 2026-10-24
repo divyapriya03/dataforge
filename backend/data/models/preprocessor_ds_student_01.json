@@ -1,0 +1,95 @@
+{
+  "numeric_scalers": {
+    "study_hours": {
+      "min": 2.0,
+      "max": 29.1
+    },
+    "attendance_rate": {
+      "min": 69.1,
+      "max": 100.0
+    },
+    "math_score": {
+      "min": 51.1,
+      "max": 100.0
+    },
+    "reading_score": {
+      "min": 55.5,
+      "max": 100.0
+    },
+    "writing_score": {
+      "min": 53.8,
+      "max": 100.0
+    }
+  },
+  "categorical_encoders": {
+    "gender": [
+      "Female",
+      "Male"
+    ],
+    "grade_level": [
+      "Freshman",
+      "Junior",
+      "Senior",
+      "Sophomore"
+    ]
+  },
+  "column_order": [
+    "gender",
+    "grade_level",
+    "study_hours",
+    "attendance_rate",
+    "math_score",
+    "reading_score",
+    "writing_score"
+  ],
+  "processed_feature_names": [
+    "gender_Female",
+    "gender_Male",
+    "grade_level_Freshman",
+    "grade_level_Junior",
+    "grade_level_Senior",
+    "grade_level_Sophomore",
+    "study_hours",
+    "attendance_rate",
+    "math_score",
+    "reading_score",
+    "writing_score"
+  ],
+  "feature_slices": {
+    "gender": [
+      0,
+      2,
+      "categorical"
+    ],
+    "grade_level": [
+      2,
+      6,
+      "categorical"
+    ],
+    "study_hours": [
+      6,
+      7,
+      "numeric"
+    ],
+    "attendance_rate": [
+      7,
+      8,
+      "numeric"
+    ],
+    "math_score": [
+      8,
+      9,
+      "numeric"
+    ],
+    "reading_score": [
+      9,
+      10,
+      "numeric"
+    ],
+    "writing_score": [
+      10,
+      11,
+      "numeric"
+    ]
+  }
+}
