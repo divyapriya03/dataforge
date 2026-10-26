@@ -123,16 +123,27 @@ dist/assets/index-CjahLxEC.js   159.99 kB
 
 ## 5. Development Launch Commands
 
-### Running Backend API:
-```powershell
-cd "c:\Users\divya\OneDrive\Desktop\dl project\backend"
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-```
+Run the commands from the repository root (the folder that contains `backend` and `frontend`).
 
-### Running Frontend UI:
+### Running Backend API
 ```powershell
-cd "c:\Users\divya\OneDrive\Desktop\dl project\frontend"
-npm run dev -- --host 127.0.0.1 --port 5173
+cd backend
+py -3.12 -m pip install -r requirements.txt        # first time only
+py -3.12 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
-Access the application at: **http://127.0.0.1:5173/**
-API Swagger documentation at: **http://127.0.0.1:8000/docs**
+Use the `--reload` flag only while editing backend code. The command must be run from the `backend` folder. API documentation (Swagger UI): http://127.0.0.1:8000/docs
+
+### Running Frontend UI
+```powershell
+cd frontend
+npm install                                        # first time only
+npm run dev                                        # http://localhost:5173
+```
+The frontend talks to the backend directly at `VITE_API_BASE_URL` (default `http://127.0.0.1:8000`), see FRONTEND_DEVELOPMENT.md section 7.1.
+
+### Checks
+```powershell
+cd backend ; py -3.12 -m pip install -r requirements-dev.txt ; py -3.12 -m pytest
+cd frontend ; npm run typecheck ; npm test ; npm run build
+```
+Backend variables (`DATAFORGE_DATA_DIR`, `DATAFORGE_DB_PATH`, `DATAFORGE_MAX_UPLOAD_MB`, `DATAFORGE_MAX_GENERATE_ROWS`, `DATAFORGE_CORS_ORIGINS`) are described in BACKEND_DEVELOPMENT.md section 3. The `backend/.env` file shown in section 3.1 is not read by the application.

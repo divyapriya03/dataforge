@@ -1,14 +1,39 @@
 import sqlite3
 import json
-import os
 from typing import List, Dict, Any, Optional
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "dataforge.db")
+from app.core import config
+
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    # Resolved on every call (see app.core.config) so it never depends on the working directory.
+    conn = sqlite3.connect(config.get_db_path(), timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# Columns added after the first release. They are applied with ALTER TABLE ... ADD COLUMN, which
+# keeps every existing row; old rows simply have NULL in the new columns.
+MIGRATIONS = {
+    "models": {
+        "model_type": "TEXT",
+        "error_message": "TEXT",
+        "started_at": "TIMESTAMP",
+        "completed_at": "TIMESTAMP",
+        "preprocessor_path": "TEXT",
+    },
+    "evaluations": {
+        "details_json": "TEXT",
+    },
+}
+
+
+def _migrate(cursor):
+    for table, columns in MIGRATIONS.items():
+        existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+        for name, col_type in columns.items():
+            if name not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
 
 def init_db():
     conn = get_db_connection()
@@ -78,6 +103,7 @@ def init_db():
     );
     """)
 
+    _migrate(cursor)
     conn.commit()
     conn.close()
 
@@ -118,17 +144,20 @@ def list_datasets() -> List[Dict[str, Any]]:
         result.append(d)
     return result
 
-def insert_model(model_id: str, dataset_id: str, name: str, params: Dict, weights_path: str = ""):
+def insert_model(model_id: str, dataset_id: str, name: str, params: Dict, weights_path: str = "",
+                 status: str = "initialized", model_type: str = "numpy-vae", preprocessor_path: Optional[str] = None):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT OR REPLACE INTO models (id, dataset_id, name, params_json, status, weights_path)
-        VALUES (?, ?, ?, ?, 'initialized', ?)
-    """, (model_id, dataset_id, name, json.dumps(params), weights_path))
+        INSERT OR REPLACE INTO models (id, dataset_id, name, params_json, status, weights_path,
+                                       model_type, preprocessor_path, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (model_id, dataset_id, name, json.dumps(params), status, weights_path, model_type, preprocessor_path))
     conn.commit()
     conn.close()
 
-def update_model_progress(model_id: str, status: str, final_loss: float = None, recon_loss: float = None, kl_loss: float = None, loss_history: List = None, weights_path: str = None):
+def update_model_progress(model_id: str, status: str, final_loss: float = None, recon_loss: float = None, kl_loss: float = None, loss_history: List = None, weights_path: str = None,
+                          error_message: str = None, preprocessor_path: str = None):
     conn = get_db_connection()
     cursor = conn.cursor()
     updates = ["status = ?"]
@@ -149,6 +178,14 @@ def update_model_progress(model_id: str, status: str, final_loss: float = None, 
     if weights_path is not None:
         updates.append("weights_path = ?")
         params.append(weights_path)
+    if preprocessor_path is not None:
+        updates.append("preprocessor_path = ?")
+        params.append(preprocessor_path)
+    if error_message is not None:
+        updates.append("error_message = ?")
+        params.append(error_message)
+    if status in ("completed", "failed"):
+        updates.append("completed_at = CURRENT_TIMESTAMP")
 
     params.append(model_id)
     cursor.execute(f"UPDATE models SET {', '.join(updates)} WHERE id = ?", params)
@@ -204,23 +241,53 @@ def list_experiments() -> List[Dict[str, Any]]:
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT e.*, d.filename as dataset_name, m.name as model_name
+        SELECT e.*, d.filename as dataset_name, m.name as model_name, m.model_type as model_type
         FROM experiments e
         LEFT JOIN datasets d ON e.dataset_id = d.id
         LEFT JOIN models m ON e.model_id = m.id
-        ORDER BY e.created_at DESC
+        ORDER BY e.created_at DESC, e.rowid DESC  -- created_at has 1 s resolution; rowid = insertion order
     """)
     rows = cursor.fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
-def insert_evaluation(exp_id: str, score: float, ks_dict: Dict, corr_delta: float, validity: float, summary_diff: Dict):
+def insert_experiment_with_evaluation(exp: Dict[str, Any], evaluation: Dict[str, Any]):
+    """Write the experiment and its evaluation in ONE transaction (both rows or neither)."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO experiments (id, dataset_id, model_id, num_records, temperature, random_seed,
+                                     output_file_path, fidelity_score, validity_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (exp["exp_id"], exp["dataset_id"], exp["model_id"], exp["num_records"], exp["temp"], exp["seed"],
+              exp["output_path"], exp["fidelity"], exp["validity"]))
+        cursor.execute("""
+            INSERT INTO evaluations (experiment_id, overall_score, ks_metrics_json, correlation_delta,
+                                     validity_percentage, summary_stats_diff_json, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (exp["exp_id"], evaluation["score"], json.dumps(evaluation["ks_dict"]), evaluation["corr_delta"],
+              evaluation["validity"], json.dumps(evaluation["summary_diff"]), json.dumps(evaluation["details"])))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def insert_evaluation(exp_id: str, score: float, ks_dict: Dict, corr_delta: float, validity: float,
+                      summary_diff: Dict, details: Optional[Dict] = None):
+    """Store (or replace) the evaluation of an experiment. ``corr_delta`` is 0.0 when unavailable; the
+    real availability is recorded in ``details['correlation_available']``."""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT OR REPLACE INTO evaluations (experiment_id, overall_score, ks_metrics_json, correlation_delta, validity_percentage, summary_stats_diff_json)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (exp_id, score, json.dumps(ks_dict), corr_delta, validity, json.dumps(summary_diff)))
+        INSERT OR REPLACE INTO evaluations (experiment_id, overall_score, ks_metrics_json, correlation_delta,
+                                            validity_percentage, summary_stats_diff_json, details_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (exp_id, score, json.dumps(ks_dict), corr_delta, validity, json.dumps(summary_diff),
+          json.dumps(details) if details is not None else None))
     conn.commit()
     conn.close()
 
@@ -234,5 +301,6 @@ def get_evaluation(exp_id: str) -> Optional[Dict[str, Any]]:
         d = dict(row)
         d['ks_metrics'] = json.loads(d['ks_metrics_json'])
         d['summary_stats_diff'] = json.loads(d['summary_stats_diff_json'])
+        d['details'] = json.loads(d['details_json']) if d.get('details_json') else {}
         return d
     return None

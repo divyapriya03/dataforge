@@ -13,15 +13,17 @@ import {
   CheckCircle2, 
   FileText 
 } from 'lucide-react';
-import { DatasetInfo, ExperimentRun, ModelRecord } from '../types';
+import { ModelRecord } from '../types';
+import type { ApiDataset, ApiExperiment } from '../types/api';
+import type { TabId } from '../routing';
 
 interface DashboardProps {
-  datasets: DatasetInfo[];
+  datasets: ApiDataset[];
   models: ModelRecord[];
-  experiments: ExperimentRun[];
-  activeDataset: DatasetInfo | null;
+  experiments: ApiExperiment[];
+  activeDataset: ApiDataset | null;
   activeModel: ModelRecord | null;
-  onNavigate: (tab: any) => void;
+  onNavigate: (tab: TabId) => void;
 }
 
 export const Dashboard: React.FC<DashboardProps> = ({
@@ -32,10 +34,12 @@ export const Dashboard: React.FC<DashboardProps> = ({
   activeModel,
   onNavigate
 }) => {
-  const totalSyntheticRows = experiments.reduce((acc, exp) => acc + exp.numRecords, 0);
-  const avgFidelity = experiments.length > 0 
-    ? (experiments.reduce((acc, exp) => acc + exp.fidelityScore, 0) / experiments.length).toFixed(1)
-    : '93.5';
+  const totalSyntheticRows = experiments.reduce((acc, exp) => acc + exp.num_records, 0);
+  const scored = experiments.filter((exp) => typeof exp.fidelity_score === 'number');
+  const validated = experiments.filter((exp) => typeof exp.validity_score === 'number');
+  const mean = (xs: number[]) => (xs.length ? (xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(1) : null);
+  const avgFidelity = mean(scored.map((e) => e.fidelity_score as number));
+  const avgValidity = mean(validated.map((e) => e.validity_score as number));
 
   return (
     <div className="space-y-6">
@@ -87,7 +91,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <Database className="w-4 h-4 text-cyan-400" />
           </div>
           <p className="text-2xl font-extrabold text-white">{datasets.length}</p>
-          <p className="text-[11px] text-cyan-400 font-medium">Active: {activeDataset ? activeDataset.name : 'None'}</p>
+          <p className="text-[11px] text-cyan-400 font-medium">Active: {activeDataset ? activeDataset.filename : 'None'}</p>
         </div>
 
         <div className="bg-slate-900/80 border border-slate-800 p-5 rounded-xl space-y-1">
@@ -113,8 +117,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
             <span>Avg Quality Fidelity</span>
             <Award className="w-4 h-4 text-amber-400" />
           </div>
-          <p className="text-2xl font-extrabold text-white">{avgFidelity}%</p>
-          <p className="text-[11px] text-amber-400 font-medium">Domain Validity: 99.8%</p>
+          <p className="text-2xl font-extrabold text-white">{avgFidelity !== null ? `${avgFidelity}%` : 'no data'}</p>
+          <p className="text-[11px] text-amber-400 font-medium">Validity: {avgValidity !== null ? `${avgValidity}%` : 'no data'} · heuristic scores, averaged over saved runs</p>
         </div>
       </div>
 
@@ -147,20 +151,20 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/60">
-                {experiments.map((exp) => (
+                {experiments.slice(0, 8).map((exp) => (
                   <tr key={exp.id} className="hover:bg-slate-800/30 transition">
                     <td className="p-3 font-mono text-slate-300 font-medium">{exp.id}</td>
-                    <td className="p-3 text-slate-200">{exp.datasetName}</td>
-                    <td className="p-3 text-slate-400">{exp.modelName}</td>
-                    <td className="p-3 font-semibold text-white">{exp.numRecords.toLocaleString()}</td>
+                    <td className="p-3 text-slate-200">{exp.dataset_name ?? exp.dataset_id}</td>
+                    <td className="p-3 text-slate-400">{exp.model_name ?? exp.model_id}</td>
+                    <td className="p-3 font-semibold text-white">{exp.num_records.toLocaleString()}</td>
                     <td className="p-3">
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
-                        {exp.fidelityScore}%
+                        {typeof exp.fidelity_score === 'number' ? `${exp.fidelity_score}%` : 'not available'}
                       </span>
                     </td>
                     <td className="p-3">
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-indigo-950/60 text-indigo-400 border border-indigo-800/40">
-                        {exp.domainValidity}%
+                        {typeof exp.validity_score === 'number' ? `${exp.validity_score}%` : 'not available'}
                       </span>
                     </td>
                     <td className="p-3 text-right">
@@ -175,6 +179,9 @@ export const Dashboard: React.FC<DashboardProps> = ({
                 ))}
               </tbody>
             </table>
+            {experiments.length === 0 && (
+              <p className="p-3 text-xs text-slate-500" data-testid="dashboard-no-runs">No experiments yet. Generate synthetic data to see runs here.</p>
+            )}
           </div>
         </div>
 
@@ -188,7 +195,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-2 text-xs">
             <div className="text-slate-400 font-mono">Evidence Lower Bound (ELBO):</div>
             <div className="text-indigo-300 font-mono font-medium p-2 bg-slate-900 rounded border border-slate-800">
-              L = MSE(x, x̂) + β · D_KL(q(z|x) || p(z))
+              L = w · ‖x − x̂‖² + β · D_KL(q(z|x) || p(z))
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed pt-1">
               Balances feature reconstruction accuracy against continuous latent Gaussian distribution smoothness.

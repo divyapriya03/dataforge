@@ -1,7 +1,14 @@
-import numpy as np
 import os
-import json
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
+
+import numpy as np
+
+# Weight on the reconstruction term = 1 / (2 * sigma^2) of a Gaussian decoder. 20 corresponds to
+# sigma^2 = 0.025, a sensible scale for features min-max scaled to [0, 1]. Chosen empirically on
+# the sample student dataset (see BACKEND_DEVELOPMENT.md); with weight 1-10 the KL term dominated
+# and the posterior collapsed.
+DEFAULT_RECON_WEIGHT = 20.0
+
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -25.0, 25.0)))
@@ -14,9 +21,21 @@ def leaky_relu_deriv(x: np.ndarray, alpha: float = 0.2) -> np.ndarray:
 
 class VariationalAutoencoder:
     """
-    Deep Variational Autoencoder (VAE) for Tabular Synthesis.
-    Implements Evidence Lower Bound (ELBO) optimization,
-    Gaussian latent reparameterization trick, and Adam optimizer.
+    Variational Autoencoder (VAE) for tabular synthesis, written in plain NumPy
+    (no PyTorch/TensorFlow): a fully connected network with exactly two hidden
+    layers in the encoder and decoder, hand-derived backpropagation and Adam.
+
+    Loss = recon_weight * reconstruction + beta * KL, with
+      reconstruction = squared error summed over features, averaged over the batch,
+      recon_weight   = 1 / (2 * sigma^2) of a fixed-variance Gaussian decoder, and
+      KL             = KL(q(z|x) || N(0, I)) summed over latent dims, averaged over the batch.
+    Summing (rather than averaging) the reconstruction error over features keeps
+    it on the same scale as the KL term; with a per-feature mean the KL term
+    dominates and the posterior collapses (the decoder ignores z and emits column
+    means), which is what the Step 1 audit observed.
+
+    All randomness comes from a per-instance ``numpy.random.Generator`` so training
+    and sampling are reproducible and never touch NumPy's global random state.
     """
     def __init__(
         self,
@@ -24,32 +43,40 @@ class VariationalAutoencoder:
         latent_dim: int = 8,
         hidden_dims: List[int] = [128, 64],
         learning_rate: float = 0.001,
-        beta: float = 1.0
+        beta: float = 1.0,
+        seed: Optional[int] = None,
+        recon_weight: float = DEFAULT_RECON_WEIGHT,
     ):
+        if input_dim < 1 or latent_dim < 1:
+            raise ValueError("input_dim and latent_dim must be positive")
+        if len(hidden_dims) != 2 or any(int(h) < 1 for h in hidden_dims):
+            raise ValueError("hidden_dims must contain exactly two positive layer sizes")
+        self.rng = np.random.default_rng(seed)
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.lr = learning_rate
         self.beta = beta
-        self.h1_dim, self.h2_dim = hidden_dims[0], hidden_dims[1]
+        self.recon_weight = float(recon_weight)
+        self.h1_dim, self.h2_dim = int(hidden_dims[0]), int(hidden_dims[1])
 
         # Xavier / Glorot Initialization
         self.params: Dict[str, np.ndarray] = {
             # Encoder
-            "W_e1": np.random.randn(input_dim, self.h1_dim) * np.sqrt(2.0 / (input_dim + self.h1_dim)),
+            "W_e1": self.rng.standard_normal((input_dim, self.h1_dim)) * np.sqrt(2.0 / (input_dim + self.h1_dim)),
             "b_e1": np.zeros((1, self.h1_dim)),
-            "W_e2": np.random.randn(self.h1_dim, self.h2_dim) * np.sqrt(2.0 / (self.h1_dim + self.h2_dim)),
+            "W_e2": self.rng.standard_normal((self.h1_dim, self.h2_dim)) * np.sqrt(2.0 / (self.h1_dim + self.h2_dim)),
             "b_e2": np.zeros((1, self.h2_dim)),
-            "W_mu": np.random.randn(self.h2_dim, latent_dim) * np.sqrt(2.0 / (self.h2_dim + latent_dim)),
+            "W_mu": self.rng.standard_normal((self.h2_dim, latent_dim)) * np.sqrt(2.0 / (self.h2_dim + latent_dim)),
             "b_mu": np.zeros((1, latent_dim)),
-            "W_logvar": np.random.randn(self.h2_dim, latent_dim) * np.sqrt(2.0 / (self.h2_dim + latent_dim)),
+            "W_logvar": self.rng.standard_normal((self.h2_dim, latent_dim)) * np.sqrt(2.0 / (self.h2_dim + latent_dim)),
             "b_logvar": np.zeros((1, latent_dim)),
             # Decoder
-            "W_d1": np.random.randn(latent_dim, self.h2_dim) * np.sqrt(2.0 / (latent_dim + self.h2_dim)),
+            "W_d1": self.rng.standard_normal((latent_dim, self.h2_dim)) * np.sqrt(2.0 / (latent_dim + self.h2_dim)),
             "b_d1": np.zeros((1, self.h2_dim)),
-            "W_d2": np.random.randn(self.h2_dim, self.h1_dim) * np.sqrt(2.0 / (self.h2_dim + self.h1_dim)),
+            "W_d2": self.rng.standard_normal((self.h2_dim, self.h1_dim)) * np.sqrt(2.0 / (self.h2_dim + self.h1_dim)),
             "b_d2": np.zeros((1, self.h1_dim)),
-            "W_out": np.random.randn(self.h1_dim, input_dim) * np.sqrt(2.0 / (self.h1_dim + input_dim)),
+            "W_out": self.rng.standard_normal((self.h1_dim, input_dim)) * np.sqrt(2.0 / (self.h1_dim + input_dim)),
             "b_out": np.zeros((1, input_dim)),
         }
 
@@ -77,7 +104,7 @@ class VariationalAutoencoder:
 
     def reparameterize(self, mu: np.ndarray, logvar: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         std = np.exp(0.5 * logvar)
-        eps = np.random.randn(*mu.shape)
+        eps = self.rng.standard_normal(mu.shape)
         z = mu + std * eps
         return z, eps
 
@@ -105,14 +132,14 @@ class VariationalAutoencoder:
 
     def compute_loss(self, X: np.ndarray, X_hat: np.ndarray, mu: np.ndarray, logvar: np.ndarray) -> Tuple[float, float, float]:
         B = X.shape[0]
-        # Reconstruction MSE loss normalized per feature
-        recon_loss = float(np.mean(np.square(X - X_hat)))
+        # Reconstruction: squared error summed over features, averaged over the batch
+        recon_loss = float(np.sum(np.square(X - X_hat)) / B)
         
         # KL Divergence: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
         var = np.exp(logvar)
         kl_div = float(-0.5 * np.sum(1.0 + logvar - np.square(mu) - var) / B)
         
-        total_loss = float(recon_loss + self.beta * kl_div)
+        total_loss = float(self.recon_weight * recon_loss + self.beta * kl_div)
         return total_loss, recon_loss, kl_div
 
     def backward(self, cache: Dict[str, Any]) -> Dict[str, np.ndarray]:
@@ -127,8 +154,8 @@ class VariationalAutoencoder:
 
         grads: Dict[str, np.ndarray] = {}
 
-        # 1. Gradient of Reconstruction MSE w.r.t Sigmoid output
-        dX_hat = (2.0 / (B * D)) * (X_hat - X)
+        # 1. Gradient of the (summed-over-features, batch-averaged) squared error w.r.t. the sigmoid output
+        dX_hat = (2.0 * self.recon_weight / B) * (X_hat - X)
         dz_out = dX_hat * X_hat * (1.0 - X_hat)
 
         grads["W_out"] = cache["a_d2"].T @ dz_out
@@ -195,7 +222,7 @@ class VariationalAutoencoder:
             self.params[k] -= (self.lr / (np.sqrt(v_hat) + self.eps)) * m_hat
 
     def train_epoch(self, X: np.ndarray, batch_size: int) -> Tuple[float, float, float]:
-        indices = np.random.permutation(X.shape[0])
+        indices = self.rng.permutation(X.shape[0])
         total_l, recon_l, kl_l = 0.0, 0.0, 0.0
         n_batches = int(np.ceil(X.shape[0] / batch_size))
 
@@ -214,19 +241,42 @@ class VariationalAutoencoder:
 
         return total_l / n_batches, recon_l / n_batches, kl_l / n_batches
 
-    def generate(self, n_samples: int, temperature: float = 1.0, seed: int = None) -> np.ndarray:
-        if seed is not None:
-            np.random.seed(seed)
-        # Sample latent vectors z ~ N(0, tau^2 * I)
-        z = np.random.randn(n_samples, self.latent_dim) * temperature
+    def generate(
+        self,
+        n_samples: int,
+        temperature: float = 1.0,
+        seed: Optional[int] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> np.ndarray:
+        """Decode z ~ N(0, temperature^2 I). Pass ``seed`` (or ``rng``) for reproducible output."""
+        if rng is None:
+            rng = np.random.default_rng(seed) if seed is not None else self.rng
+        z = rng.standard_normal((n_samples, self.latent_dim)) * temperature
         X_hat, _ = self.decode(z)
         return X_hat
 
     def save(self, filepath: str):
-        # Save weights in .npz
-        np.savez(filepath, **self.params)
+        """Write weights to ``filepath`` (.npz) atomically."""
+        tmp = filepath + ".tmp.npz"
+        np.savez(tmp, **self.params)
+        os.replace(tmp, filepath)
 
     def load(self, filepath: str):
-        data = np.load(filepath)
-        for k in self.params:
-            self.params[k] = data[k]
+        """Load weights; raises ValueError if the file is unreadable or does not match this architecture."""
+        try:
+            with np.load(filepath, allow_pickle=False) as data:  # closes the file handle (Windows cannot replace an open file)
+                loaded = {k: np.asarray(data[k]) for k in self.params}
+        except FileNotFoundError:
+            raise
+        except KeyError as e:
+            raise ValueError(f"model file is missing parameter {e}") from e
+        except Exception as e:  # corrupt / not an npz
+            raise ValueError(f"model file could not be read: {e}") from e
+        for k, arr in loaded.items():
+            if arr.shape != self.params[k].shape:
+                raise ValueError(
+                    f"model file is incompatible: '{k}' has shape {arr.shape}, expected {self.params[k].shape}"
+                )
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"model file contains non-finite values in '{k}'")
+        self.params = loaded

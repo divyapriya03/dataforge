@@ -1,271 +1,256 @@
 import React, { useState } from 'react';
-import { 
-  Sparkles, 
-  Database, 
-  Download, 
-  BarChart3, 
-  Sliders, 
-  CheckCircle2, 
-  RefreshCw, 
-  ArrowRight,
-  Layers
-} from 'lucide-react';
-import { DatasetInfo, ExperimentRun, ModelRecord } from '../types';
+import { ArrowRight, BarChart3, BrainCircuit, CheckCircle2, Download, History, Loader2, Sparkles, XCircle } from 'lucide-react';
+import { inflight, useInflight } from '../services/inflight';
+import { GENERATE_TIMEOUT_MS, generateSynthetic, type ApiErrorKind } from '../services/api';
+import { useCsvDownload } from '../hooks/useCsvDownload';
+import { fmtPct } from '../services/format';
+import type { ModelRecord } from '../types';
+import type { ApiDataset, ApiGenerateResponse, GenerateRequest } from '../types/api';
 
 interface DataGeneratorProps {
-  dataset: DatasetInfo;
+  /** Models from the backend; only completed ones can generate. */
   models: ModelRecord[];
-  activeModel: ModelRecord | null;
-  onGenerationComplete: (run: ExperimentRun) => void;
-  onNavigateToQuality: () => void;
+  datasets: ApiDataset[];
+  selectedModelId: string;
+  onSelectModel: (modelId: string) => void;
+  /** Called after the server confirmed the generation (the experiment is stored and exportable). */
+  onGenerated: (result: ApiGenerateResponse) => void;
+  onNavigateToModelLab: () => void;
+  onNavigateToQuality: (experimentId: string) => void;
   onNavigateToHistory: () => void;
 }
 
+// Limits of GenerateRequest (backend/app/schemas/api_models.py). The maximum number of rows is
+// configurable on the server (DATAFORGE_MAX_GENERATE_ROWS, default 50000); the server's message is shown if it is lower.
+export const GEN_LIMITS = {
+  records: { min: 10, max: 50000 },
+  temperature: { min: 0.1, max: 2.5 },
+  seed: { min: 0, max: 2 ** 32 - 1 },
+} as const;
+
+type Fields = { numRecords: string; temperature: string; randomSeed: string };
+type Errors = Partial<Record<keyof Fields, string>>;
+type RunState =
+  | { phase: 'idle' }
+  | { phase: 'running' }
+  | { phase: 'success'; result: ApiGenerateResponse }
+  | { phase: 'error'; message: string; kind: ApiErrorKind };
+
+export function validateGeneration(values: Fields, modelId: string, datasetId: string): { errors: Errors; request?: GenerateRequest } {
+  const errors: Errors = {};
+  const n = values.numRecords.trim() === '' ? NaN : Number(values.numRecords);
+  if (!Number.isInteger(n)) errors.numRecords = 'Number of records must be a whole number.';
+  else if (n < GEN_LIMITS.records.min || n > GEN_LIMITS.records.max)
+    errors.numRecords = `Number of records must be between ${GEN_LIMITS.records.min} and ${GEN_LIMITS.records.max.toLocaleString('en-US')}.`;
+
+  const t = values.temperature.trim() === '' ? NaN : Number(values.temperature);
+  if (!Number.isFinite(t)) errors.temperature = 'Temperature must be a number.';
+  else if (t < GEN_LIMITS.temperature.min || t > GEN_LIMITS.temperature.max)
+    errors.temperature = `Temperature must be between ${GEN_LIMITS.temperature.min} and ${GEN_LIMITS.temperature.max}.`;
+
+  let seed: number | undefined;
+  if (values.randomSeed.trim() !== '') {
+    const s = Number(values.randomSeed);
+    if (!Number.isInteger(s) || s < GEN_LIMITS.seed.min || s > GEN_LIMITS.seed.max) errors.randomSeed = `Random seed must be a whole number between 0 and ${GEN_LIMITS.seed.max.toLocaleString('en-US')}.`;
+    else seed = s;
+  }
+  if (!modelId) return { errors };
+  if (Object.keys(errors).length) return { errors };
+  return { errors, request: { model_id: modelId, dataset_id: datasetId, num_records: n, temperature: t, ...(seed !== undefined ? { random_seed: seed } : {}) } };
+}
+
+const card = 'bg-slate-900/80 border border-slate-800 rounded-2xl p-6';
+const input = 'w-full bg-slate-950 border rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:opacity-60';
+const btn = 'inline-flex items-center justify-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 disabled:opacity-50 disabled:cursor-not-allowed';
+
 export const DataGenerator: React.FC<DataGeneratorProps> = ({
-  dataset,
   models,
-  activeModel,
-  onGenerationComplete,
+  datasets,
+  selectedModelId,
+  onSelectModel,
+  onGenerated,
+  onNavigateToModelLab,
   onNavigateToQuality,
-  onNavigateToHistory
+  onNavigateToHistory,
 }) => {
-  const [selectedModelId, setSelectedModelId] = useState<string>(activeModel?.id || (models[0]?.id || ''));
-  const [numRecords, setNumRecords] = useState<number>(1000);
-  const [temperature, setTemperature] = useState<number>(1.0);
-  const [randomSeed, setRandomSeed] = useState<number>(42);
-  const [isGenerating, setIsGenerating] = useState<boolean>(false);
-  const [generatedRecords, setGeneratedRecords] = useState<Record<string, any>[]>([]);
+  const usableModels = models.filter((m) => m.status === 'completed');
+  const model = usableModels.find((m) => m.id === selectedModelId) ?? usableModels[0] ?? null;
+  const dataset = model ? datasets.find((d) => d.id === model.datasetId) ?? null : null;
 
-  const handleGenerate = () => {
-    setIsGenerating(true);
-    setTimeout(() => {
-      // Synthesize realistic records based on source dataset features and temperature
-      const activeCols = dataset.columns.filter(c => c.included);
-      const synthRows: Record<string, any>[] = [];
+  const [values, setValues] = useState<Fields>({ numRecords: '1000', temperature: '1', randomSeed: '' });
+  const [errors, setErrors] = useState<Errors>({});
+  const [run, setRun] = useState<RunState>({ phase: 'idle' });
+  const generatingPending = useInflight('generate'); // survives leaving and re-entering the page
+  const csv = useCsvDownload();
 
-      for (let i = 0; i < Math.min(numRecords, 50); i++) {
-        const row: Record<string, any> = { row_id: `#${i + 1}` };
-        activeCols.forEach(col => {
-          if (col.inferredType === 'numeric' && col.min !== undefined && col.max !== undefined) {
-            // Gaussian sampling around mean with std scaled by temperature
-            const std = (col.std || 10) * temperature;
-            const mean = col.mean || 50;
-            const u1 = Math.random();
-            const u2 = Math.random();
-            const z = Math.sqrt(-2.0 * Math.log(u1 || 0.0001)) * Math.cos(2.0 * Math.PI * u2);
-            let val = mean + z * std;
-            val = Math.max(col.min, Math.min(col.max, val)); // domain clipping
-            row[col.name] = +(val.toFixed(1));
-          } else if (col.categories && col.categories.length > 0) {
-            const cat = col.categories[Math.floor(Math.random() * col.categories.length)];
-            row[col.name] = cat;
-          } else {
-            row[col.name] = "Sample";
-          }
-        });
-        row['validity'] = "Valid ✓";
-        synthRows.push(row);
-      }
-
-      setGeneratedRecords(synthRows);
-      setIsGenerating(false);
-
-      const newRun: ExperimentRun = {
-        id: `gen_${Date.now()}`,
-        datasetName: dataset.name,
-        modelName: models.find(m => m.id === selectedModelId)?.name || 'Custom VAE',
-        numRecords,
-        temperature,
-        fidelityScore: +(92.5 + Math.random() * 3.5).toFixed(1),
-        domainValidity: 99.8,
-        avgKsStat: 0.041,
-        createdAt: new Date().toISOString().replace('T', ' ').substring(0, 16),
-        records: synthRows
-      };
-
-      onGenerationComplete(newRun);
-    }, 800);
+  const setField = (name: keyof Fields, value: string) => {
+    setValues((v) => ({ ...v, [name]: value }));
+    setErrors((e) => (e[name] ? { ...e, [name]: undefined } : e));
   };
 
-  const activeCols = dataset.columns.filter(c => c.included);
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!model || inflight.has('generate')) return;
+    const { errors: found, request } = validateGeneration(values, model.id, model.datasetId);
+    setErrors(found);
+    if (!request) return;
+    if (!inflight.begin('generate')) return;
+    setRun({ phase: 'running' });
+    try {
+      const res = await generateSynthetic(request);
+      if (res.success && res.data && typeof res.data.experiment_id === 'string') {
+        setRun({ phase: 'success', result: res.data });
+        onGenerated(res.data);
+      } else if (res.success) {
+        setRun({ phase: 'error', kind: 'format', message: 'The server returned a response without an experiment ID.' });
+      } else {
+        setRun({ phase: 'error', kind: res.kind ?? 'http', message: res.error ?? 'Generation failed.' });
+      }
+    } finally {
+      inflight.end('generate');
+    }
+  };
+
+  const running = run.phase === 'running' || generatingPending;
+  const result = run.phase === 'success' ? run.result : null;
+  const columns = result && result.preview_records.length > 0 ? Object.keys(result.preview_records[0]) : [];
+  const downloadingResult = result ? csv.downloading.includes(result.experiment_id) : false;
+
+  const field = (name: keyof Fields, label: string, help: string, placeholder?: string) => (
+    <div>
+      <label htmlFor={`gen-${name}`} className="block text-slate-300 text-xs font-medium mb-1">{label}</label>
+      <input
+        id={`gen-${name}`}
+        type="text"
+        inputMode="decimal"
+        value={values[name]}
+        placeholder={placeholder}
+        disabled={running}
+        aria-invalid={errors[name] ? true : undefined}
+        aria-describedby={`gen-${name}-help${errors[name] ? ` gen-${name}-error` : ''}`}
+        onChange={(e) => setField(name, e.target.value)}
+        className={`${input} ${errors[name] ? 'border-rose-500' : 'border-slate-800'}`}
+      />
+      <p id={`gen-${name}-help`} className="text-[11px] text-slate-500 mt-1">{help}</p>
+      {errors[name] && <p id={`gen-${name}-error`} role="alert" className="text-[11px] text-rose-400 mt-1">{errors[name]}</p>}
+    </div>
+  );
 
   return (
     <div className="space-y-6">
-      {/* Top Header */}
-      <div className="flex items-center justify-between bg-slate-900/80 border border-slate-800 p-5 rounded-2xl">
-        <div>
-          <h2 className="text-xl font-bold text-white tracking-tight">
-            Data Generator: Latent Space Sampling & Synthesis
-          </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            Draw continuous Gaussian vectors z ~ N(0, τ² I) and pass them through the trained VAE Decoder.
-          </p>
-        </div>
-        {generatedRecords.length > 0 && (
-          <div className="flex space-x-3">
-            <button
-              onClick={onNavigateToQuality}
-              className="inline-flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-md shadow-indigo-600/30 transition"
-            >
-              <BarChart3 className="w-3.5 h-3.5" />
-              <span>Inspect in Quality Lab</span>
-            </button>
-            <button
-              onClick={onNavigateToHistory}
-              className="inline-flex items-center space-x-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold px-4 py-2 rounded-lg border border-slate-700 transition"
-            >
-              <Download className="w-3.5 h-3.5" />
-              <span>Export CSV</span>
-            </button>
-          </div>
-        )}
+      <div className="bg-slate-900/80 border border-slate-800 p-5 rounded-2xl">
+        <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
+          <Sparkles className="w-5 h-5 text-indigo-400" aria-hidden="true" /> Data Generator
+        </h2>
+        <p className="text-xs text-slate-400 mt-1 max-w-2xl">
+          Sample new rows from a trained model. Each generation is saved on the server as an experiment with its own CSV file and saved evaluation.
+        </p>
       </div>
 
-      {/* Generator Controls */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-6">
-        <div className="flex items-center space-x-2 text-indigo-400 font-semibold text-sm border-b border-slate-800 pb-3">
-          <Sliders className="w-4 h-4" />
-          <span>Generation Controls & Sampling Hyperparameters</span>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-5 text-xs">
-          {/* Target Model */}
-          <div>
-            <label className="block text-slate-300 font-medium mb-1.5">Trained VAE Model</label>
-            <select
-              value={selectedModelId}
-              onChange={(e) => setSelectedModelId(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 outline-none focus:ring-1 focus:ring-indigo-500"
-            >
-              {models.map(m => (
-                <option key={m.id} value={m.id}>{m.name}</option>
-              ))}
-            </select>
-          </div>
-
-          {/* Record Count */}
-          <div>
-            <div className="flex justify-between text-slate-300 font-medium mb-1.5">
-              <span>Synthetic Record Count</span>
-              <span className="text-cyan-400 font-bold">{numRecords.toLocaleString()}</span>
-            </div>
-            <input
-              type="number"
-              min="100"
-              max="20000"
-              step="500"
-              value={numRecords}
-              onChange={(e) => setNumRecords(parseInt(e.target.value) || 100)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-slate-200 outline-none"
-            />
-          </div>
-
-          {/* Temperature Slider */}
-          <div>
-            <div className="flex justify-between text-slate-300 font-medium mb-1.5">
-              <span>Sampling Temperature (τ)</span>
-              <span className="text-amber-400 font-bold">{temperature.toFixed(1)}</span>
-            </div>
-            <input
-              type="range"
-              min="0.2"
-              max="1.8"
-              step="0.1"
-              value={temperature}
-              onChange={(e) => setTemperature(parseFloat(e.target.value))}
-              className="w-full accent-amber-500 bg-slate-950 h-1.5 rounded cursor-pointer mt-1"
-            />
-            <div className="flex justify-between text-[10px] text-slate-500 mt-0.5">
-              <span>0.2 (High Fidelity)</span>
-              <span>1.8 (Diverse)</span>
-            </div>
-          </div>
-
-          {/* Random Seed */}
-          <div>
-            <label className="block text-slate-300 font-medium mb-1.5">Random Seed</label>
-            <input
-              type="number"
-              value={randomSeed}
-              onChange={(e) => setRandomSeed(parseInt(e.target.value) || 0)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-slate-200 outline-none"
-            />
-          </div>
-        </div>
-
-        {/* Generate Trigger Button */}
-        <div>
-          <button
-            onClick={handleGenerate}
-            disabled={isGenerating}
-            className="w-full flex items-center justify-center space-x-2 bg-gradient-to-r from-indigo-600 via-indigo-500 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white font-bold py-3 rounded-xl shadow-lg shadow-indigo-600/30 text-sm transition"
-          >
-            {isGenerating ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>Sampling Latent Vectors & Decoding...</span>
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-4 h-4" />
-                <span>Generate {numRecords.toLocaleString()} Synthetic Records</span>
-              </>
-            )}
+      {usableModels.length === 0 ? (
+        <div className={card} data-testid="no-models">
+          <p className="text-sm text-slate-200 font-medium">No trained models yet.</p>
+          <p className="text-xs text-slate-400 mt-1">Train a model first; completed models appear here.</p>
+          <button type="button" onClick={onNavigateToModelLab} className={`${btn} mt-3 bg-indigo-600 hover:bg-indigo-500 text-white`}>
+            <BrainCircuit className="w-3.5 h-3.5" aria-hidden="true" /> Go to Model Lab
           </button>
         </div>
-      </div>
-
-      {/* Generated Synthetic Data Preview Grid */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-          <h3 className="font-semibold text-white text-base">
-            Generated Synthetic Output Preview {generatedRecords.length > 0 && `(Showing first ${generatedRecords.length} records)`}
-          </h3>
-          {generatedRecords.length > 0 && (
-            <span className="inline-flex items-center text-xs font-semibold text-emerald-400 bg-emerald-950/60 px-2.5 py-1 rounded-full border border-emerald-800/40">
-              <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> All Constraints Passed
-            </span>
-          )}
-        </div>
-
-        {generatedRecords.length > 0 ? (
-          <div className="overflow-x-auto max-h-96">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-950/80 sticky top-0 text-slate-400 uppercase tracking-wider text-[10px]">
-                <tr>
-                  <th className="p-3">Index</th>
-                  {activeCols.map(c => (
-                    <th key={c.name} className="p-3">{c.name}</th>
-                  ))}
-                  <th className="p-3 text-right">Domain Check</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                {generatedRecords.map((row, idx) => (
-                  <tr key={idx} className="hover:bg-slate-800/30 transition">
-                    <td className="p-3 font-mono text-slate-400 font-semibold">{row.row_id}</td>
-                    {activeCols.map(c => (
-                      <td key={c.name} className="p-3 font-mono text-slate-200">
-                        {row[c.name]}
-                      </td>
-                    ))}
-                    <td className="p-3 text-right">
-                      <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
-                        {row.validity}
-                      </span>
-                    </td>
-                  </tr>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <form onSubmit={submit} noValidate aria-label="Generation setup" className={`${card} lg:col-span-1 space-y-4`}>
+            <h3 className="text-indigo-400 font-semibold text-sm border-b border-slate-800 pb-3">Generation settings</h3>
+            <div>
+              <label htmlFor="gen-model" className="block text-slate-300 text-xs font-medium mb-1">Trained model</label>
+              <select id="gen-model" value={model?.id ?? ''} disabled={running} onChange={(e) => onSelectModel(e.target.value)} className={`${input} border-slate-800`}>
+                {usableModels.map((m) => (
+                  <option key={m.id} value={m.id}>{m.name} ({m.id})</option>
                 ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className="py-12 text-center text-slate-500 space-y-2">
-            <Sparkles className="w-8 h-8 mx-auto opacity-40" />
-            <p className="text-xs">Click "Generate Synthetic Records" above to sample the latent space</p>
-          </div>
-        )}
-      </div>
+              </select>
+              <p className="text-[11px] text-slate-500 mt-1" data-testid="model-dataset">
+                Trained on {dataset ? `${dataset.filename} (${dataset.id})` : `dataset ${model?.datasetId} (record not found)`}. Rows are generated for this dataset's columns.
+              </p>
+            </div>
+            {field('numRecords', 'Number of records', `${GEN_LIMITS.records.min} to ${GEN_LIMITS.records.max.toLocaleString('en-US')} (the server may set a lower limit).`)}
+            {field('temperature', 'Temperature', `${GEN_LIMITS.temperature.min} to ${GEN_LIMITS.temperature.max}. Scales the random latent sample: lower stays near typical rows, higher is more varied.`)}
+            {field('randomSeed', 'Random seed (optional)', 'Whole number for reproducible output. Leave empty to use the server default (42).', '42')}
+            <button
+              type="submit"
+              disabled={running}
+              className={`${btn} w-full py-3 text-sm bg-indigo-600 hover:bg-indigo-500 text-white`}
+            >
+              {running ? <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> : <Sparkles className="w-4 h-4" aria-hidden="true" />}
+              {running ? 'Generating…' : 'Generate synthetic data'}
+            </button>
+          </form>
+
+          <section className={`${card} lg:col-span-2 min-w-0`} aria-labelledby="gen-result-heading" aria-live="polite">
+            <h3 id="gen-result-heading" className="text-indigo-400 font-semibold text-sm border-b border-slate-800 pb-3 mb-4">Result</h3>
+            {run.phase === 'idle' && <p className="text-sm text-slate-400" data-testid="gen-idle">Nothing generated yet in this session. Choose settings and generate.</p>}
+            {running && (
+              <p className="text-sm text-slate-200 flex items-center gap-2" data-testid="gen-running">
+                <Loader2 className="w-4 h-4 animate-spin text-amber-400" aria-hidden="true" /> Waiting for the server… (gives up after {Math.round(GENERATE_TIMEOUT_MS / 60000)} minutes)
+              </p>
+            )}
+            {run.phase === 'error' && (
+              <div role="alert" data-testid="gen-error" className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-lg p-3 flex gap-2">
+                <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" aria-hidden="true" />
+                <span>
+                  Generation failed: {run.message}
+                  {(run.kind === 'network' || run.kind === 'timeout') && ' The outcome is unknown; check Export History to see whether the experiment was saved.'}
+                </span>
+              </div>
+            )}
+
+            {result && (
+              <div className="space-y-4" data-testid="gen-result">
+                <p className="text-sm text-emerald-300 flex items-center gap-2"><CheckCircle2 className="w-4 h-4" aria-hidden="true" /> Generated and saved by the server.</p>
+                <dl className="grid grid-cols-[auto,1fr] gap-x-4 gap-y-1.5 text-xs">
+                  <dt className="text-slate-500">Experiment ID</dt><dd className="font-mono text-slate-200" data-testid="gen-experiment-id">{result.experiment_id}</dd>
+                  <dt className="text-slate-500">Model ID</dt><dd className="font-mono text-slate-200">{result.model_id}</dd>
+                  <dt className="text-slate-500">Dataset ID</dt><dd className="font-mono text-slate-200">{result.dataset_id}</dd>
+                  <dt className="text-slate-500">Records</dt><dd className="text-slate-200">{result.num_records.toLocaleString('en-US')}</dd>
+                  <dt className="text-slate-500">Temperature</dt><dd className="text-slate-200">{result.temperature}</dd>
+                  <dt className="text-slate-500">Output file</dt><dd className="text-slate-200">{result.output_filename}</dd>
+                  <dt className="text-slate-500">Fidelity score (heuristic)</dt><dd className="text-slate-200" data-testid="gen-fidelity">{fmtPct(result.fidelity_score)}</dd>
+                  <dt className="text-slate-500">Validity</dt><dd className="text-slate-200" data-testid="gen-validity">{fmtPct(result.domain_validity_percent)}</dd>
+                </dl>
+                <p className="text-[11px] text-slate-500">The fidelity score is a heuristic summary of statistical similarity, not a guarantee of data quality or privacy. Open the quality comparison for the full saved evaluation.</p>
+
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" disabled={downloadingResult} onClick={() => csv.download(result.experiment_id)} className={`${btn} bg-indigo-600 hover:bg-indigo-500 text-white`}>
+                    {downloadingResult ? <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" /> : <Download className="w-3.5 h-3.5" aria-hidden="true" />}
+                    {downloadingResult ? 'Downloading…' : 'Download CSV'}
+                  </button>
+                  <button type="button" onClick={() => onNavigateToQuality(result.experiment_id)} className={`${btn} border border-slate-700 hover:border-indigo-500 text-slate-200`}>
+                    <BarChart3 className="w-3.5 h-3.5" aria-hidden="true" /> Compare quality <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
+                  </button>
+                  <button type="button" onClick={onNavigateToHistory} className={`${btn} border border-slate-700 hover:border-indigo-500 text-slate-200`}>
+                    <History className="w-3.5 h-3.5" aria-hidden="true" /> Export History
+                  </button>
+                </div>
+                {csv.notice && (
+                  <p role={csv.notice.kind === 'error' ? 'alert' : 'status'} data-testid="download-notice" className={`text-xs ${csv.notice.kind === 'error' ? 'text-rose-300' : 'text-emerald-300'}`}>{csv.notice.text}</p>
+                )}
+
+                {columns.length > 0 && (
+                  <div className="overflow-x-auto" data-testid="gen-preview">
+                    <p className="text-[11px] text-slate-500 mb-1">First {result.preview_records.length} of {result.num_records.toLocaleString('en-US')} generated rows.</p>
+                    <table className="w-full text-xs text-left">
+                      <caption className="sr-only">Preview of generated records</caption>
+                      <thead className="text-slate-500"><tr>{columns.map((c) => <th key={c} scope="col" className="py-1.5 pr-3 font-medium whitespace-nowrap">{c}</th>)}</tr></thead>
+                      <tbody>
+                        {result.preview_records.map((r, i) => (
+                          <tr key={i} className="border-t border-slate-800 text-slate-300">{columns.map((c) => <td key={c} className="py-1 pr-3 whitespace-nowrap">{String(r[c] ?? '')}</td>)}</tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
     </div>
   );
 };

@@ -1,264 +1,234 @@
-import React, { useState } from 'react';
-import { 
-  BarChart3, 
-  Award, 
-  CheckCircle2, 
-  AlertTriangle, 
-  Sliders, 
-  TrendingUp, 
-  ArrowRight, 
-  Download 
-} from 'lucide-react';
-import { 
-  BarChart, 
-  Bar, 
-  XAxis, 
-  YAxis, 
-  CartesianGrid, 
-  Tooltip, 
-  Legend, 
-  ResponsiveContainer 
-} from 'recharts';
-import { DatasetInfo, ExperimentRun, SummaryStatComparison } from '../types';
-import { statComparisons } from '../services/mockData';
+import React, { useEffect, useState } from 'react';
+import { BarChart3, Download, History, Loader2, Sparkles } from 'lucide-react';
+import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { evaluateRun } from '../services/api';
+import { useCsvDownload } from '../hooks/useCsvDownload';
+import { EvaluationPanel } from '../components/EvaluationPanel';
+import { UNAVAILABLE, fmtNum, fmtText, isNum, statusLabel } from '../services/format';
+import type { ApiEvaluation, ApiExperiment } from '../types/api';
+
+type LoadState = { phase: 'loading' } | { phase: 'ready' } | { phase: 'error'; message: string };
+type EvalState =
+  | { phase: 'loading' }
+  | { phase: 'ok'; data: ApiEvaluation }
+  | { phase: 'unavailable' }
+  | { phase: 'error'; message: string };
 
 interface QualityComparisonProps {
-  dataset: DatasetInfo;
-  activeExperiment: ExperimentRun | null;
+  experiments: ApiExperiment[];
+  experimentsState: LoadState;
+  selectedExperimentId: string;
+  onSelectExperiment: (id: string) => void;
+  onReloadExperiments: () => void;
+  onNavigateToGenerator: () => void;
   onNavigateToHistory: () => void;
 }
 
+const card = 'bg-slate-900/80 border border-slate-800 rounded-2xl p-6';
+const btn = 'inline-flex items-center justify-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-indigo-300 disabled:opacity-50 disabled:cursor-not-allowed';
+
 export const QualityComparison: React.FC<QualityComparisonProps> = ({
-  dataset,
-  activeExperiment,
-  onNavigateToHistory
+  experiments,
+  experimentsState,
+  selectedExperimentId,
+  onSelectExperiment,
+  onReloadExperiments,
+  onNavigateToGenerator,
+  onNavigateToHistory,
 }) => {
-  const [selectedFeature, setSelectedFeature] = useState<string>('math_score');
+  const experiment = experiments.find((e) => e.id === selectedExperimentId) ?? experiments[0] ?? null;
+  const [evaluation, setEvaluation] = useState<EvalState>({ phase: 'loading' });
+  const [tick, setTick] = useState(0);
+  const csv = useCsvDownload(onReloadExperiments);
 
-  // Distribution bins generator for comparison chart
-  const getDistributionData = (feature: string) => {
-    return [
-      { bin: '40-50', realCount: 45, syntheticCount: 42 },
-      { bin: '50-60', realCount: 110, syntheticCount: 115 },
-      { bin: '60-70', realCount: 240, syntheticCount: 235 },
-      { bin: '70-80', realCount: 320, syntheticCount: 328 },
-      { bin: '80-90', realCount: 210, syntheticCount: 204 },
-      { bin: '90-100', realCount: 75, syntheticCount: 76 },
-    ];
-  };
+  useEffect(() => {
+    if (!experiment) return;
+    let cancelled = false;
+    setEvaluation({ phase: 'loading' });
+    evaluateRun(experiment.id).then((res) => {
+      if (cancelled) return;
+      if (res.success && res.data && res.data.experiment_id === experiment.id) setEvaluation({ phase: 'ok', data: res.data });
+      else if (res.success) setEvaluation({ phase: 'error', message: 'The server returned an evaluation for a different experiment.' });
+      else if (res.status === 404) setEvaluation({ phase: 'unavailable' });
+      else setEvaluation({ phase: 'error', message: res.error ?? 'Could not load the evaluation.' });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [experiment?.id, tick]);
 
-  const distributionData = getDistributionData(selectedFeature);
-  const fidelity = activeExperiment ? activeExperiment.fidelityScore : 93.8;
-  const validity = activeExperiment ? activeExperiment.domainValidity : 99.8;
+  const ev = evaluation.phase === 'ok' ? evaluation.data : null;
+  const categorical = Object.entries(ev?.categorical_metrics ?? {}).filter(([, m]) => m.real_proportions && m.synthetic_proportions);
+  const summary = ev?.summary_comparisons ?? [];
 
   return (
     <div className="space-y-6">
-      {/* Top Banner */}
-      <div className="flex items-center justify-between bg-slate-900/80 border border-slate-800 p-5 rounded-2xl">
-        <div>
-          <h2 className="text-xl font-bold text-white tracking-tight">
-            Quality Comparison: Empirical Fidelity & Parity
-          </h2>
-          <p className="text-xs text-slate-400 mt-1">
-            Evaluate statistical similarity between real and synthesized features using two-sample KS tests and correlation deltas.
-          </p>
-        </div>
-        <button
-          onClick={onNavigateToHistory}
-          className="inline-flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-md shadow-indigo-600/30 transition"
-        >
-          <span>Export Certified CSV</span>
-          <ArrowRight className="w-3.5 h-3.5" />
-        </button>
+      <div className="bg-slate-900/80 border border-slate-800 p-5 rounded-2xl">
+        <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
+          <BarChart3 className="w-5 h-5 text-indigo-400" aria-hidden="true" /> Quality Comparison
+        </h2>
+        <p className="text-xs text-slate-400 mt-1 max-w-2xl">
+          How closely a generated dataset matches the data it was learned from, using the evaluation the server saved when the data was generated.
+        </p>
       </div>
 
-      {/* Top Metrics Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="bg-gradient-to-br from-indigo-950/70 to-slate-900 border border-indigo-500/30 p-5 rounded-2xl space-y-1">
-          <div className="flex items-center justify-between text-indigo-300 text-xs font-medium">
-            <span>Overall Data Fidelity Score</span>
-            <Award className="w-4 h-4 text-indigo-400" />
-          </div>
-          <p className="text-3xl font-extrabold text-white">{fidelity}%</p>
-          <div className="flex items-center text-[11px] text-emerald-400 font-semibold space-x-1">
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            <span>High Fidelity Synthetic Quality</span>
-          </div>
+      {experimentsState.phase === 'loading' && (
+        <p role="status" className="text-sm text-slate-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Loading experiments…</p>
+      )}
+      {experimentsState.phase === 'error' && (
+        <div role="alert" className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-lg p-3 flex justify-between gap-3">
+          <span>Could not load experiments: {experimentsState.message}</span>
+          <button type="button" onClick={onReloadExperiments} className="text-xs underline whitespace-nowrap">Retry</button>
         </div>
+      )}
 
-        <div className="bg-slate-900/80 border border-slate-800 p-5 rounded-2xl space-y-1">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-            <span>Domain Boundary Validity</span>
-            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-          </div>
-          <p className="text-3xl font-extrabold text-white">{validity}%</p>
-          <p className="text-[11px] text-emerald-400 font-medium">Zero Out-of-Bounds Violations</p>
+      {experimentsState.phase === 'ready' && !experiment && (
+        <div className={card} data-testid="no-experiments">
+          <p className="text-sm text-slate-200 font-medium">No experiments to compare yet.</p>
+          <p className="text-xs text-slate-400 mt-1">Generate synthetic data first; each generation is saved with its evaluation.</p>
+          <button type="button" onClick={onNavigateToGenerator} className={`${btn} mt-3 bg-indigo-600 hover:bg-indigo-500 text-white`}>
+            <Sparkles className="w-3.5 h-3.5" aria-hidden="true" /> Go to Data Generator
+          </button>
         </div>
+      )}
 
-        <div className="bg-slate-900/80 border border-slate-800 p-5 rounded-2xl space-y-1">
-          <div className="flex items-center justify-between text-slate-400 text-xs font-medium">
-            <span>Avg Kolmogorov-Smirnov Stat</span>
-            <TrendingUp className="w-4 h-4 text-cyan-400" />
-          </div>
-          <p className="text-3xl font-extrabold text-white">0.039</p>
-          <p className="text-[11px] text-cyan-400 font-medium">p &gt; 0.05 (Distributions Match)</p>
-        </div>
-      </div>
-
-      {/* Main Charts: Overlaid Distribution & Correlation Delta */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Feature Distribution Overlay Chart */}
-        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <div className="flex items-center space-x-2 text-indigo-400 font-semibold text-sm">
-              <BarChart3 className="w-4 h-4" />
-              <span>Feature Density Comparison</span>
+      {experiment && (
+        <>
+          <section className={card} aria-labelledby="qc-exp-heading">
+            <h3 id="qc-exp-heading" className="text-indigo-400 font-semibold text-sm border-b border-slate-800 pb-3 mb-4">Experiment</h3>
+            <div className="flex flex-wrap items-end gap-4">
+              <div>
+                <label htmlFor="qc-experiment" className="block text-[11px] text-slate-400 mb-1">Experiment</label>
+                <select
+                  id="qc-experiment"
+                  value={experiment.id}
+                  onChange={(e) => onSelectExperiment(e.target.value)}
+                  className="bg-slate-950 border border-slate-800 rounded-md px-2 py-1.5 text-xs text-slate-200 outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 min-w-[18rem]"
+                >
+                  {experiments.map((e) => (
+                    <option key={e.id} value={e.id}>{e.id} · {e.dataset_name ?? e.dataset_id} · {e.num_records.toLocaleString('en-US')} rows</option>
+                  ))}
+                </select>
+              </div>
+              <dl className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-0.5 text-xs" data-testid="qc-experiment-info">
+                <dt className="text-slate-500">Experiment ID</dt><dd className="font-mono text-slate-200">{experiment.id}</dd>
+                <dt className="text-slate-500">Dataset</dt><dd className="text-slate-200">{experiment.dataset_name ?? 'record removed'} <span className="font-mono text-slate-500">({experiment.dataset_id})</span></dd>
+                <dt className="text-slate-500">Model</dt><dd className="text-slate-200">{experiment.model_name ?? 'record removed'} <span className="font-mono text-slate-500">({experiment.model_id})</span></dd>
+                <dt className="text-slate-500">Synthetic rows</dt><dd className="text-slate-200">{experiment.num_records.toLocaleString('en-US')}</dd>
+                <dt className="text-slate-500">Created (UTC)</dt><dd className="text-slate-200">{fmtText(experiment.created_at)}</dd>
+                <dt className="text-slate-500">Status</dt><dd className="text-slate-200">{statusLabel(experiment.status)}</dd>
+              </dl>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={!experiment.output_available || csv.downloading.includes(experiment.id)}
+                  onClick={() => csv.download(experiment.id)}
+                  className={`${btn} bg-indigo-600 hover:bg-indigo-500 text-white`}
+                >
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" /> Download this CSV
+                </button>
+                <button type="button" onClick={onNavigateToHistory} className={`${btn} border border-slate-700 hover:border-indigo-500 text-slate-200`}>
+                  <History className="w-3.5 h-3.5" aria-hidden="true" /> Export History
+                </button>
+              </div>
             </div>
-            <select
-              value={selectedFeature}
-              onChange={(e) => setSelectedFeature(e.target.value)}
-              className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1 text-slate-200 text-xs outline-none"
-            >
-              <option value="math_score">math_score</option>
-              <option value="reading_score">reading_score</option>
-              <option value="writing_score">writing_score</option>
-              <option value="study_hours">study_hours</option>
-              <option value="attendance_rate">attendance_rate</option>
-            </select>
-          </div>
+            {csv.notice && (
+              <p role={csv.notice.kind === 'error' ? 'alert' : 'status'} data-testid="download-notice" className={`mt-3 text-xs ${csv.notice.kind === 'error' ? 'text-rose-300' : 'text-emerald-300'}`}>{csv.notice.text}</p>
+            )}
+          </section>
 
-          <div className="h-64 w-full pt-1">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={distributionData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                <XAxis dataKey="bin" stroke="#64748b" tick={{ fontSize: 11 }} />
-                <YAxis stroke="#64748b" tick={{ fontSize: 11 }} />
-                <Tooltip 
-                  contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '12px' }} 
-                />
-                <Legend wrapperStyle={{ fontSize: '12px', paddingTop: '8px' }} />
-                <Bar dataKey="realCount" name="Real Ground Truth" fill="#6366f1" radius={[4, 4, 0, 0]} />
-                <Bar dataKey="syntheticCount" name="VAE Synthetic Data" fill="#10b981" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-          <p className="text-[11px] text-slate-400 text-center">
-            Overlaid histograms confirming continuous distribution match across density bins.
-          </p>
-        </div>
+          <section className={card} aria-labelledby="qc-eval-heading">
+            <h3 id="qc-eval-heading" className="text-indigo-400 font-semibold text-sm border-b border-slate-800 pb-3 mb-4">Saved evaluation</h3>
+            {evaluation.phase === 'loading' && <p role="status" className="text-sm text-slate-400 flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" /> Loading evaluation…</p>}
+            {evaluation.phase === 'unavailable' && (
+              <p data-testid="qc-no-evaluation" className="text-sm text-amber-300">This experiment has no saved evaluation result, so there is nothing to compare.</p>
+            )}
+            {evaluation.phase === 'error' && (
+              <p role="alert" className="text-sm text-rose-300">
+                Could not load the evaluation: {evaluation.message}{' '}
+                <button type="button" onClick={() => setTick((t) => t + 1)} className="underline">Retry</button>
+              </p>
+            )}
+            {ev && (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+                <EvaluationPanel ev={ev} />
 
-        {/* Correlation Delta Matrix */}
-        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
-          <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-            <div className="flex items-center space-x-2 text-indigo-400 font-semibold text-sm">
-              <TrendingUp className="w-4 h-4" />
-              <span>Correlation Matrix Delta (|Real - Synthetic|)</span>
-            </div>
-            <span className="text-[11px] font-mono text-emerald-400">Frobenius Norm: 0.041</span>
-          </div>
+                <div className="space-y-5 text-xs min-w-0">
+                  <div>
+                    <h5 className="text-slate-400 font-semibold mb-1">Numeric columns: real vs synthetic summary</h5>
+                    {summary.length === 0 ? (
+                      <p className="text-slate-500" data-testid="qc-no-summary">No numeric summary is stored for this experiment.</p>
+                    ) : (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left" data-testid="qc-summary">
+                          <caption className="sr-only">Real and synthetic means and standard deviations</caption>
+                          <thead className="text-slate-500">
+                            <tr>
+                              <th scope="col" className="font-medium pr-3">Column</th>
+                              <th scope="col" className="font-medium pr-3">Mean (real / synthetic)</th>
+                              <th scope="col" className="font-medium pr-3">Std (real / synthetic)</th>
+                              <th scope="col" className="font-medium">KS</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {summary.map((r) => (
+                              <tr key={r.feature} className="border-t border-slate-800 text-slate-300" data-testid={`qc-summary-${r.feature}`}>
+                                <td className="py-1 pr-3">{r.feature}</td>
+                                <td className="py-1 pr-3">{fmtNum(r.realMean, 2)} / {fmtNum(r.syntheticMean, 2)}</td>
+                                <td className="py-1 pr-3">{fmtNum(r.realStd, 2)} / {fmtNum(r.syntheticStd, 2)}</td>
+                                <td className="py-1">{fmtNum(r.ksStatistic)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
 
-          <div className="overflow-x-auto pt-2">
-            <table className="w-full text-center text-xs font-mono">
-              <thead>
-                <tr className="text-slate-400 text-[11px]">
-                  <th className="p-2 text-left">Feature</th>
-                  <th className="p-2">math</th>
-                  <th className="p-2">read</th>
-                  <th className="p-2">write</th>
-                  <th className="p-2">study</th>
-                  <th className="p-2">atten</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60">
-                <tr>
-                  <td className="p-2 text-left text-slate-300 font-sans font-semibold">math</td>
-                  <td className="p-2 bg-slate-950 text-slate-500">0.00</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.04</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                </tr>
-                <tr>
-                  <td className="p-2 text-left text-slate-300 font-sans font-semibold">read</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-slate-950 text-slate-500">0.00</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.01</td>
-                </tr>
-                <tr>
-                  <td className="p-2 text-left text-slate-300 font-sans font-semibold">write</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-slate-950 text-slate-500">0.00</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                </tr>
-                <tr>
-                  <td className="p-2 text-left text-slate-300 font-sans font-semibold">study</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.04</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-slate-950 text-slate-500">0.00</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.04</td>
-                </tr>
-                <tr>
-                  <td className="p-2 text-left text-slate-300 font-sans font-semibold">atten</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.02</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.01</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.03</td>
-                  <td className="p-2 bg-indigo-950/40 text-emerald-400">0.04</td>
-                  <td className="p-2 bg-slate-950 text-slate-500">0.00</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <p className="text-[11px] text-slate-400 text-center">
-            Max feature pair correlation deviation &lt; 0.05, confirming multi-variable dependency preservation.
-          </p>
-        </div>
-      </div>
+                  <div>
+                    <h5 className="text-slate-400 font-semibold mb-1">Categorical columns: category proportions</h5>
+                    {categorical.length === 0 ? (
+                      <p className="text-slate-500" data-testid="qc-no-proportions">No category proportions are stored for this experiment.</p>
+                    ) : (
+                      categorical.map(([name, m]) => {
+                        const cats = Array.from(new Set([...Object.keys(m.real_proportions!), ...Object.keys(m.synthetic_proportions!)]));
+                        const data = cats
+                          .map((c) => ({ category: c, real: m.real_proportions![c], synthetic: m.synthetic_proportions![c] }))
+                          .filter((d) => isNum(d.real) && isNum(d.synthetic));
+                        return (
+                          <div key={name} className="mb-4" data-testid={`qc-proportions-${name}`}>
+                            <div className="text-slate-300 mb-1">{name} <span className="text-slate-500">(TVD {fmtNum(m.tvd)})</span></div>
+                            <div className="h-40" aria-label={`Category proportions of ${name}`}>
+                              <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={data} margin={{ top: 5, right: 10, left: -15, bottom: 0 }}>
+                                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                  <XAxis dataKey="category" stroke="#64748b" fontSize={10} />
+                                  <YAxis stroke="#64748b" fontSize={10} domain={[0, 1]} />
+                                  <Tooltip contentStyle={{ background: '#0f172a', border: '1px solid #1e293b', fontSize: 11 }} />
+                                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                                  <Bar dataKey="real" name="Real" fill="#38bdf8" />
+                                  <Bar dataKey="synthetic" name="Synthetic" fill="#818cf8" />
+                                </BarChart>
+                              </ResponsiveContainer>
+                            </div>
+                          </div>
+                        );
+                      })
+                    )}
+                  </div>
 
-      {/* Summary Statistics Comparison Table */}
-      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-6 space-y-4">
-        <h3 className="font-semibold text-white text-base">
-          Descriptive Statistics & Kolmogorov-Smirnov Hypothesis Tests
-        </h3>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-slate-950/70 text-slate-400 uppercase tracking-wider text-[10px]">
-              <tr>
-                <th className="p-3">Feature</th>
-                <th className="p-3">Real Mean (Std)</th>
-                <th className="p-3">Synthetic Mean (Std)</th>
-                <th className="p-3">Mean Delta</th>
-                <th className="p-3">KS Statistic</th>
-                <th className="p-3">p-value</th>
-                <th className="p-3 text-right">Fidelity Status</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-800/60">
-              {statComparisons.map((stat) => (
-                <tr key={stat.feature} className="hover:bg-slate-800/30 transition">
-                  <td className="p-3 font-mono font-semibold text-cyan-300">{stat.feature}</td>
-                  <td className="p-3 text-slate-300">{stat.realMean} (±{stat.realStd})</td>
-                  <td className="p-3 text-slate-200 font-semibold">{stat.syntheticMean} (±{stat.syntheticStd})</td>
-                  <td className="p-3 font-mono text-emerald-400">
-                    {Math.abs(stat.realMean - stat.syntheticMean).toFixed(2)}
-                  </td>
-                  <td className="p-3 font-mono text-slate-300">{stat.ksStatistic}</td>
-                  <td className="p-3 font-mono text-slate-300">{stat.pValue}</td>
-                  <td className="p-3 text-right">
-                    <span className="inline-flex items-center px-2.5 py-0.5 rounded text-[11px] font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
-                      <CheckCircle2 className="w-3 h-3 mr-1" /> {stat.status}
-                    </span>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+                  <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-3 space-y-1 text-[11px] text-slate-400" data-testid="qc-interpretation">
+                    <p className="text-slate-300 font-semibold">How to read these numbers</p>
+                    <p>KS statistic and total variation distance range from 0 (identical) to 1; lower is closer. “Passed” means below 0.15 and “Warning” below 0.25, a convention of this project, not a statistical test result.</p>
+                    <p>Correlation differences compare pairwise linear relationships between numeric columns only. The matrices themselves are not stored, so only the summary differences are shown ({UNAVAILABLE} when fewer than two numeric columns varied).</p>
+                    <p>The fidelity score is a weighted heuristic of these statistics. It says nothing about privacy or about how useful the data is for a particular task.</p>
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+        </>
+      )}
     </div>
   );
 };

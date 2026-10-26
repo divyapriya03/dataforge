@@ -3,7 +3,10 @@ import json
 import os
 import sys
 
-BASE_URL = "http://127.0.0.1:8000/api"
+# Manual smoke test against a RUNNING server. It writes data (a model, a generation, an upload), so point
+# it at a scratch server: DATAFORGE_API_URL=http://127.0.0.1:8001/api python test_backend_api.py
+# The automated, isolated tests live in tests/ (run `python -m pytest`).
+BASE_URL = os.environ.get("DATAFORGE_API_URL", "http://127.0.0.1:8000/api")
 
 def run_tests():
     print("==================================================")
@@ -22,8 +25,13 @@ def run_tests():
     assert res.status_code == 200, f"List datasets failed: {res.text}"
     datasets = res.json()
     assert len(datasets) > 0, "No datasets found in database"
-    dataset_id = datasets[0]["id"]
-    print(f"✓ Success: Found {len(datasets)} dataset(s). Target dataset: {dataset_id} ({datasets[0]['filename']})")
+    # Prefer the seeded sample dataset; otherwise any dataset large enough to train on (>= 10 rows).
+    target = next((d for d in datasets if d["id"] == "ds_student_01"), None) or next(
+        (d for d in datasets if d["rowCount"] >= 10), None
+    )
+    assert target is not None, "No dataset with at least 10 rows found"
+    dataset_id = target["id"]
+    print(f"✓ Success: Found {len(datasets)} dataset(s). Target dataset: {dataset_id} ({target['filename']})")
 
     # 3. Get single dataset info
     print(f"\n[TEST 3] GET /api/datasets/{dataset_id}")

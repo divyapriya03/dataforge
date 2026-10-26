@@ -1,10 +1,11 @@
 import React from 'react';
 import { Database, BrainCircuit, Sparkles, RefreshCw } from 'lucide-react';
-import { DatasetInfo, ModelRecord } from '../types';
+import { ModelRecord } from '../types';
+import type { ApiDataset } from '../types/api';
 
 interface NavbarProps {
   title: string;
-  activeDataset: DatasetInfo | null;
+  activeDataset: ApiDataset | null;
   activeModel: ModelRecord | null;
   onRefresh: () => void;
   loading: boolean;
@@ -32,7 +33,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           <Database className="w-3.5 h-3.5 text-cyan-400" />
           <span className="text-slate-400">Dataset:</span>
           <span className="font-semibold text-slate-200">
-            {activeDataset ? activeDataset.name : 'None selected'}
+            {activeDataset ? activeDataset.filename : 'None selected'}
           </span>
           {activeDataset && (
             <span className="text-[10px] text-cyan-400 bg-cyan-950/60 px-1.5 py-0.2 rounded border border-cyan-800/40">
